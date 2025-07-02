@@ -1,0 +1,788 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'Create a VPC and two EC2 instances.'
+
+# The Metadata tells AWS how to display the parameters during stack creation
+Parameters:
+  VPCCIDR:
+    Description: VPC CIDR Block
+    Type: String
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+    Default: "172.31.0.0/16"
+
+  PublicSubnetCIDR:
+    Description: CIDR Block for the Public Subnet, must be a valid subnet of the VPC CIDR and not overlap with PrivateSubnetCIDR
+    Type: String
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+    Default: "172.31.16.0/20"
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Description: EC2 instance type for the cluster.
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  # Specifies the size of the root disk for all EC2 instances, including master
+  # and nodes.
+  DiskSizeGb:
+    Description: "Size of the root disk for the EC2 instances, in GiB.  Default: 8"
+    Default: 8
+    Type: Number
+    MinValue: 8
+    MaxValue: 30
+
+  AdminIngressLocation:
+    Description: CIDR block (IP address range) to allow SSH access to the
+      bastion host and HTTPS access to the Kubernetes API. Use 0.0.0.0/0
+      to allow access from all locations.
+    Type: String
+    MinLength: "9"
+    MaxLength: "18"
+    Default: "0.0.0.0/0"
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+  UbuntuImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+Conditions:
+  UsEast1Condition:
+    Fn::Equals:
+      - !Ref AWS::Region
+      - "us-east-1"
+
+Resources:
+  # Resources for new VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      Tags:
+        - Key: Name
+          Value: 'Lab VPC'
+
+  DHCPOptions:
+    Type: AWS::EC2::DHCPOptions
+    Properties:
+      DomainName:
+        Fn::If:
+          - UsEast1Condition
+          - "ec2.internal"
+          - !Sub "${AWS::Region}.compute.internal"
+      DomainNameServers:
+        - AmazonProvidedDNS
+
+  VPCDHCPOptionsAssociation:
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+    Properties:
+      VpcId: !Ref VPC
+      DhcpOptionsId: !Ref DHCPOptions
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Network
+          Value: Public
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCIDR
+      AvailabilityZone: !Select 
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: Public subnet
+        - Key: Network
+          Value: Public
+        - Key: KubernetesCluster
+          Value: !Ref AWS::StackName
+      MapPublicIpOnLaunch: true
+
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Subnets
+        - Key: Network
+          Value: Public
+
+  PublicSubnetRoute:
+    DependsOn: VPCGatewayAttachment
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicSubnetRouteTable
+
+  ClusterSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for all machines in the cluster
+      VpcId: !Ref VPC
+      Tags:
+        - Key: KubernetesCluster
+          Value: !Ref AWS::StackName
+        - Key:
+            !Sub "kubernetes.io/cluster/${AWS::StackName}"
+          Value: "owned"
+        - Key: Name
+          Value: k8s-cluster-security-group
+
+  ClusterSecGroupCrossTalk:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      SourceSecurityGroupId: !Ref ClusterSecGroup
+      IpProtocol: "-1"
+      FromPort: "0"
+      ToPort: "65535"
+
+  ClusterSecGroupAllow22:
+    Metadata:
+      Comment: Open up port 22 for SSH into each machine
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      IpProtocol: tcp
+      FromPort: "22"
+      ToPort: "22"
+      CidrIp: !Ref AdminIngressLocation
+
+  ClusterSecGroupAllowInstanceConnect22Ipv6:
+    Metadata:
+      Comment: Open up port 22 for SSH into each machine
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      IpProtocol: tcp
+      FromPort: "22"
+      ToPort: "22"
+      CidrIpv6: ::/0
+
+  ClusterSecGroupAllowNodePort:
+    Metadata:
+      Comment: Open up port NodePort to each machine
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      IpProtocol: tcp
+      FromPort: "30000"
+      ToPort: "32767"
+      CidrIp: !Ref AdminIngressLocation
+
+  ClusterSecGroupAllowHttp:
+    Metadata:
+      Comment: Open up port NodePort to each machine
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      IpProtocol: tcp
+      FromPort: "80"
+      ToPort: "80"
+      CidrIp: !Ref AdminIngressLocation
+
+  ClusterSecGroupAllow8080:
+    Metadata:
+      Comment: Open up port 8080 to each machine
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      IpProtocol: tcp
+      FromPort: "8080"
+      ToPort: "8080"
+      CidrIp: !Ref AdminIngressLocation
+
+  ClusterSecGroupAllowHAProxy:
+    Metadata:
+      Comment: Open up port 9999 (stats) to each machine
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecGroup
+      IpProtocol: tcp
+      FromPort: "9999"
+      ToPort: "9999"
+      CidrIp: !Ref AdminIngressLocation
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: node
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeAssociation
+                  - ssm:GetDeployablePatchSnapshotForInstance
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetDocument
+                  - ssm:GetManifest
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:ListAssociations
+                  - ssm:ListCommands
+                  - ssm:ListInstanceAssociations
+                  - ssm:PutInventory
+                  - ssm:PutComplianceItems
+                  - ssm:PutConfigurePackageResult
+                  - ssm:SendCommand
+                  - ssm:UpdateAssociationStatus
+                  - ssm:UpdateInstanceAssociationStatus
+                  - ssm:UpdateInstanceInformation
+                  - ec2:Describe*
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetRepositoryPolicy
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                  - ecr:BatchGetImage
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel"
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: "*" #change this to allow SSM and stuff
+
+        - PolicyName: S3LogAgent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                  - s3:Put*
+                Resource: "*"
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref NodeRole
+
+  WorkerInstance0:
+    Type: 'AWS::EC2::Instance'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+    Properties:
+      ImageId: !Ref UbuntuImageId
+      KeyName: !Ref KeyName
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref NodeInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref ClusterSecGroup
+      SourceDestCheck: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: '30'
+            DeleteOnTermination: 'false'
+            Encrypted: 'true'
+      Tags:
+        - Key: Name
+          Value: K8s Worker 0
+      UserData:
+        Fn::Base64: !Sub |+
+          #!/bin/bash -ex
+
+          export HOSTNAME=k8s-worker-0
+          export USER=student
+          NODE_IP=$(ec2metadata --local-ipv4)
+          echo $NODE_IP " $HOSTNAME" | cat - /etc/hosts > temp && mv temp /etc/hosts
+
+          K8S_VERSION=1.29
+          K8S_RELEASE=$K8S_VERSION.1
+
+          apt-get update \
+            && apt-get upgrade -y \
+            --allow-downgrades --allow-remove-essential \
+            --allow-change-held-packages
+
+          apt-get install -y vim python3-pip ec2-instance-connect
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+          apt-get install -y \
+            apt-transport-https \
+            ca-certificates \
+            curl \
+            gnupg \
+            lsb-release
+
+          #add kubernetes package repos && gpg key
+          mkdir -m 755 /etc/apt/keyrings
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+          sudo apt-get update
+          APT_K8S_RELEASE=${!K8S_RELEASE}-1.1
+
+          apt-get install -y kubeadm=$APT_K8S_RELEASE kubelet=$APT_K8S_RELEASE kubectl=$APT_K8S_RELEASE
+          apt-mark hold kubelet kubeadm kubectl
+          systemctl enable --now kubelet
+          swapoff -a
+          modprobe overlay
+          modprobe br_netfilter
+
+          cat <<EOF | sudo tee /etc/sysctl.d/kubernetes.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          EOF
+
+          sysctl --system
+
+          cat <<EOF | tee /etc/modules-load.d/containerd.conf
+          overlay
+          br_netfilter
+          EOF
+
+          sysctl --system
+
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+          add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          apt-get update
+          apt-get install containerd.io -y
+
+          mkdir -p /etc/containerd
+          containerd config default | sudo tee /etc/containerd/config.toml
+          sed -e 's/SystemdCgroup = false/SystemdCgroup = true/g' -i /etc/containerd/config.toml
+          systemctl restart containerd
+          systemctl enable containerd
+
+          export VER="v1.26.0"
+          wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VER/crictl-$VER-linux-amd64.tar.gz
+          tar zxvf crictl-$VER-linux-amd64.tar.gz
+          mv crictl /usr/local/bin
+
+          crictl config --set \
+          runtime-endpoint=unix:///run/containerd/containerd.sock \
+          --set image-endpoint=unix:///run/containerd/containerd.sock
+
+          echo 'ClientAliveInterval 50' | tee --append /etc/ssh/sshd_config
+          service ssh restart
+
+          hostnamectl set-hostname $HOSTNAME
+          adduser --disabled-password --gecos "" $USER
+          mkdir /home/$USER/.ssh
+          echo "$USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/90-cloud-init-users
+          cp /home/ubuntu/.ssh/authorized_keys /home/$USER/.ssh/
+          chown -R $USER:$USER /home/$USER/.ssh/
+          chmod -R go-rx /home/$USER/.ssh
+          /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WorkerInstance0 --region ${AWS::Region}
+          sleep 10
+          reboot now
+
+  WorkerInstance1:
+    Type: 'AWS::EC2::Instance'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+    Properties:
+      ImageId: !Ref UbuntuImageId
+      KeyName: !Ref KeyName
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref NodeInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref ClusterSecGroup
+      SourceDestCheck: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: '30'
+            DeleteOnTermination: 'false'
+            Encrypted: 'true'
+      Tags:
+        - Key: Name
+          Value: K8s Worker 1
+      UserData:
+        Fn::Base64: !Sub |+
+          #!/bin/bash -ex
+
+          export HOSTNAME=k8s-worker-1
+          export USER=student
+          NODE_IP=$(ec2metadata --local-ipv4)
+          echo $NODE_IP " $HOSTNAME" | cat - /etc/hosts > temp && mv temp /etc/hosts
+
+          K8S_VERSION=1.29
+          K8S_RELEASE=$K8S_VERSION.1
+
+          apt-get update \
+            && apt-get upgrade -y \
+            --allow-downgrades --allow-remove-essential \
+            --allow-change-held-packages
+
+          apt-get install -y vim python3-pip ec2-instance-connect
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+          apt-get install -y \
+            apt-transport-https \
+            ca-certificates \
+            curl \
+            gnupg \
+            lsb-release
+
+          #add kubernetes package repos && gpg key
+          mkdir -m 755 /etc/apt/keyrings
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+          sudo apt-get update
+          APT_K8S_RELEASE=${!K8S_RELEASE}-1.1
+
+          apt-get install -y kubeadm=$APT_K8S_RELEASE kubelet=$APT_K8S_RELEASE kubectl=$APT_K8S_RELEASE
+          apt-mark hold kubelet kubeadm kubectl
+          systemctl enable --now kubelet
+          swapoff -a
+          modprobe overlay
+          modprobe br_netfilter
+
+          cat <<EOF | sudo tee /etc/sysctl.d/kubernetes.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          EOF
+
+          sysctl --system
+
+          cat <<EOF | tee /etc/modules-load.d/containerd.conf
+          overlay
+          br_netfilter
+          EOF
+
+          sysctl --system
+
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+          add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          apt-get update
+          apt-get install containerd.io -y
+
+          mkdir -p /etc/containerd
+          containerd config default | sudo tee /etc/containerd/config.toml
+          sed -e 's/SystemdCgroup = false/SystemdCgroup = true/g' -i /etc/containerd/config.toml
+          systemctl restart containerd
+          systemctl enable containerd
+
+          export VER="v1.26.0"
+          wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VER/crictl-$VER-linux-amd64.tar.gz
+          tar zxvf crictl-$VER-linux-amd64.tar.gz
+          mv crictl /usr/local/bin
+
+          crictl config --set \
+          runtime-endpoint=unix:///run/containerd/containerd.sock \
+          --set image-endpoint=unix:///run/containerd/containerd.sock
+
+          echo 'ClientAliveInterval 50' | tee --append /etc/ssh/sshd_config
+          service ssh restart
+
+          hostnamectl set-hostname $HOSTNAME
+          adduser --disabled-password --gecos "" $USER
+          mkdir /home/$USER/.ssh
+          echo "$USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/90-cloud-init-users
+          cp /home/ubuntu/.ssh/authorized_keys /home/$USER/.ssh/
+          chown -R $USER:$USER /home/$USER/.ssh/
+          chmod -R go-rx /home/$USER/.ssh
+          /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WorkerInstance1 --region ${AWS::Region}
+          sleep 10
+          reboot now
+
+  ControllerInstance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn:
+    - WorkerInstance0
+    - WorkerInstance1
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+    Properties:
+      ImageId: !Ref UbuntuImageId
+      KeyName: !Ref KeyName
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref NodeInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref ClusterSecGroup
+            # - !Ref SSHSecurityGroup
+      SourceDestCheck: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: '30'
+            DeleteOnTermination: 'false'
+            Encrypted: 'true'
+      Tags:
+        - Key: Name
+          Value: K8s Controller
+      UserData:
+        Fn::Base64: !Sub |+
+          #!/bin/bash -ex
+
+          export HOSTNAME=k8s-controller-0
+          export USER=student
+          NODE_IP=$(ec2metadata --local-ipv4)
+          echo $NODE_IP " $HOSTNAME" | cat - /etc/hosts > temp && mv temp /etc/hosts
+
+          K8S_VERSION=1.29
+          K8S_RELEASE=$K8S_VERSION.1
+
+          apt-get update \
+            && apt-get upgrade -y \
+            --allow-downgrades --allow-remove-essential \
+            --allow-change-held-packages
+
+          apt-get install -y vim python3-pip ec2-instance-connect jq awscli
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+          apt-get install -y \
+            apt-transport-https \
+            ca-certificates \
+            curl \
+            gnupg \
+            lsb-release
+
+          #add kubernetes package repos && gpg key
+          mkdir -m 755 /etc/apt/keyrings
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v$K8S_VERSION/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+          sudo apt-get update
+          APT_K8S_RELEASE=${!K8S_RELEASE}-1.1
+
+          apt-get install -y kubeadm=$APT_K8S_RELEASE kubelet=$APT_K8S_RELEASE kubectl=$APT_K8S_RELEASE
+          apt-mark hold kubelet kubeadm kubectl
+
+          systemctl enable --now kubelet
+          swapoff -a
+          modprobe overlay
+          modprobe br_netfilter
+
+          cat <<EOF | sudo tee /etc/sysctl.d/kubernetes.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          EOF
+
+          sysctl --system
+
+          cat <<EOF | tee /etc/modules-load.d/containerd.conf
+          overlay
+          br_netfilter
+          EOF
+
+          sysctl --system
+
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+          add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          apt-get update
+          apt-get install containerd.io -y
+
+          mkdir -p /etc/containerd
+          containerd config default | sudo tee /etc/containerd/config.toml
+          sed -e 's/SystemdCgroup = false/SystemdCgroup = true/g' -i /etc/containerd/config.toml
+          systemctl restart containerd
+          systemctl enable containerd
+
+          export VER="v1.26.0"
+          wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VER/crictl-$VER-linux-amd64.tar.gz
+          tar zxvf crictl-$VER-linux-amd64.tar.gz
+          mv crictl /usr/local/bin
+
+          crictl config --set \
+          runtime-endpoint=unix:///run/containerd/containerd.sock \
+          --set image-endpoint=unix:///run/containerd/containerd.sock
+
+          cat <<EOF >> kubeadm-config.yaml
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: $K8S_RELEASE
+          controlPlaneEndpoint: "$HOSTNAME:6443"
+          networking:
+            podSubnet: $POD_CIDR
+          ---
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          serverTLSBootstrap: true
+          EOF
+
+          hostnamectl set-hostname $HOSTNAME
+          kubeadm init --node-name $HOSTNAME --config=kubeadm-config.yaml --upload-certs | tee /var/log/kubeadm-init.log
+
+          adduser --disabled-password --gecos "" $USER
+          mkdir /home/$USER/.ssh
+          echo "$USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/90-cloud-init-users
+          cp /home/ubuntu/.ssh/authorized_keys /home/$USER/.ssh/
+          chown -R $USER:$USER /home/$USER/.ssh/
+          chmod -R go-rx /home/$USER/.ssh
+
+          # Configure the non-root user to use kubectl
+          mkdir -p /home/$USER/.kube
+          cp -f /etc/kubernetes/admin.conf /home/$USER/.kube/config
+          chown -R $USER:$USER /home/$USER/.kube/config
+
+          # Use Cilium as the network plugin
+          # Install the CLI first
+          export CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
+          export CLI_ARCH=amd64
+
+          # Ensure correct architecture
+          if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+          curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/$CILIUM_CLI_VERSION/cilium-linux-$CLI_ARCH.tar.gz{,.sha256sum}
+
+          # Make sure download worked
+          sha256sum --check cilium-linux-$CLI_ARCH.tar.gz.sha256sum
+
+          # Move binary to correct location and remove tarball
+          tar xzvfC cilium-linux-$CLI_ARCH.tar.gz /usr/local/bin
+          rm cilium-linux-$CLI_ARCH.tar.gz{,.sha256sum}
+
+          # Now that binary is in place, install network plugin
+          export KUBECONFIG=/home/$USER/.kube/config
+          cilium install
+
+          # Add Helm to make our life easier
+          curl -sSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+          echo 'ClientAliveInterval 50' | tee --append /etc/ssh/sshd_config
+          service ssh restart
+
+          mkdir -p /home/$USER/.ssh
+          echo "$USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/90-cloud-init-users
+          cp /home/ubuntu/.ssh/authorized_keys /home/$USER/.ssh/
+          chown -R $USER:$USER /home/$USER/.ssh/
+          chmod -R go-rx /home/$USER/.ssh
+
+          cd /home/$USER
+          git clone https://github.com/qalearning/qakf-labs.git
+
+          echo 'echo '"$NODE_IP"' k8s-controller-0 | cat - /etc/hosts > temp && mv temp /etc/hosts' > /tmp/setup_hosts.sh
+
+          KUBEADM_JOIN=$(kubeadm token create --print-join-command)
+          echo $KUBEADM_JOIN" --node-name k8s-worker-0" > /tmp/join_command_0.sh
+          echo $KUBEADM_JOIN" --node-name k8s-worker-1" > /tmp/join_command_1.sh
+
+          echo "source <(kubectl completion bash)" >> /root/.bashrc
+          echo "source <(kubectl completion bash)" >>  /home/$USER/.bashrc
+          echo "alias k=kubectl" >> /root/.bashrc
+          echo "alias k=kubectl" >> /home/$USER/.bashrc
+          echo "complete -F __start_kubectl k" >> /root/.bashrc
+          echo "complete -F __start_kubectl k" >> /home/$USER/.bashrc
+          echo "source <(helm completion bash)" >>  /home/$USER/.bashrc
+          echo "set expandtab" >>  /home/$USER/.vimrc
+          echo "set tabstop=2" >>  /home/$USER/.vimrc
+
+          chown -R $USER:$USER /home/$USER/
+
+          AWS_REGION=$(curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+
+          aws ssm send-command --region $AWS_REGION \
+              --targets Key=instanceids,Values=${WorkerInstance0} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands=["$(cat /tmp/setup_hosts.sh)"]
+
+          aws ssm send-command --region $AWS_REGION \
+              --targets Key=instanceids,Values=${WorkerInstance0} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands=["$(cat /tmp/join_command_0.sh)"]
+
+          aws ssm send-command --region $AWS_REGION \
+              --targets Key=instanceids,Values=${WorkerInstance1} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands=["$(cat /tmp/setup_hosts.sh)"]
+
+          aws ssm send-command --region $AWS_REGION \
+              --targets Key=instanceids,Values=${WorkerInstance1} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands=["$(cat /tmp/join_command_1.sh)"]
+
+          sleep 30
+          #approve CSRs
+          #see https://particule.io/en/blog/kubeadm-metrics-server/
+          kubectl certificate approve $(kubectl get csr --output=name)
+
+          /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ControllerInstance --region ${AWS::Region}
+          sleep 10
+          reboot now
+
+Outputs:
+  ControllerPublicIp:
+    Description: IP Address of the controller node.
+    Value: !GetAtt ControllerInstance.PublicIp
+
+  ControllerPrivateIp:
+    Description: Private IP address of the controller.
+    Value: !GetAtt ControllerInstance.PrivateIp
+
+  Worker0PublicIp:
+    Value: !GetAtt WorkerInstance0.PublicIp
+
+  Worker0PrivateIp:
+    Value: !GetAtt WorkerInstance0.PrivateIp
+
+  Worker1PublicIp:
+    Value: !GetAtt WorkerInstance1.PublicIp
+
+  Worker1PrivateIp:
+    Value: !GetAtt WorkerInstance1.PrivateIp
